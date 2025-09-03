@@ -1,0 +1,7 @@
+root: ./data/amazon23
+splits: {train: train, valid: validation, test: test}
+text_fields: [title, description]
+image_field: image
+user_col: user_id
+item_col: item_id
+ts_col: timestamp

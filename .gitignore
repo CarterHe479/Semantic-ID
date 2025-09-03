@@ -1,0 +1,29 @@
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+*.egg-info/
+
+# 数据与产物（体积大，不入库）
+data/
+outputs/
+logs/
+checkpoints/
+tmp/
+
+# Hugging Face / Datasets 缓存
+.cache/
+~/.cache/huggingface/
+~/.cache/datasets/
+
+# Jupyter
+.ipynb_checkpoints/
+EOF
