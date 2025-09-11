@@ -21,7 +21,6 @@ def load_items_emb(emb_path, ids_path, normalize=True):
     return X, ids, id2idx
 
 def vq_quantize(z, codebook):  # z: [d], codebook: [K,d]
-    # 返回 int
     z = z[None, :]
     c_norm = (codebook**2).sum(1)[None, :]
     z_norm = (z**2).sum(1, keepdims=True)
@@ -47,15 +46,41 @@ def code_key_from_codes(codes):
         return "-".join(str(int(x)) for x in codes)
     return str(int(codes))
 
-def build_user_profiles(train_df, valid_df, id2idx, X, id_col="item_id", user_col="user_id"):
-    df_hist = pd.concat([train_df[[user_col, id_col]], valid_df[[user_col, id_col]]], ignore_index=True)
+def topM_neighbors(C, center_idx, M=2):
+    """
+    返回包含“自身”的 top-M 近邻码字索引（基于 L2 距离）
+    C: [K, d]  ndarray(float32/float64)
+    """
+    c = C[center_idx]                  # [d]
+    # 正确的一维距离：||x||^2 - 2 x·c + ||c||^2
+    d = np.sum(C * C, axis=1) - 2.0 * (C @ c) + np.sum(c * c)   # [K]
+    nn = np.argsort(d)[:max(1, M)]     # 最小的 M 个（包括自身）
+    return nn.tolist()
+
+def build_user_profiles(train_df, valid_df, id2idx, X, id_col="item_id", user_col="user_id",
+                        strategy="lastN", lastN=5):
+    # 合并历史，尽量按 timestamp 排序；缺失就用原顺序
+    cols = [user_col, id_col]
+    if "timestamp" in train_df.columns: cols.append("timestamp")
+    df_hist = pd.concat([train_df[cols], valid_df[cols]], ignore_index=True)
     df_hist[id_col] = df_hist[id_col].astype(str)
-    users = df_hist[user_col].unique().tolist()
+
+    if "timestamp" in df_hist.columns:
+        df_hist = df_hist.sort_values(["user_id", "timestamp"]).reset_index(drop=True)
+
     profiles = {}
-    for u, g in df_hist.groupby(user_col):
-        idxs = [id2idx[i] for i in g[id_col].tolist() if i in id2idx]
-        if not idxs:
+    for u, g in df_hist.groupby(user_col, sort=False):
+        items = [i for i in g[id_col].tolist() if i in id2idx]
+        if not items: 
             continue
+
+        if strategy == "mean":
+            idxs = [id2idx[i] for i in items]
+        elif strategy == "last":
+            idxs = [id2idx[items[-1]]]
+        else:  # lastN
+            idxs = [id2idx[i] for i in items[-lastN:]]
+
         v = X[idxs].mean(axis=0)
         profiles[u] = v / (np.linalg.norm(v) + 1e-9)
     return profiles
@@ -66,19 +91,23 @@ def ndcg_at_k(rank, k):
     return 1.0 / math.log2(rank + 2.0)  # rank从0开始
 
 def evaluate_method(
-    name, codebooks, inverted, test_df, profiles, X, id2idx, faiss_index=None, faiss_ids=None,
-    topk_list=(10,50,100), use_faiss_rerank=False
+    name, codebooks, inverted, test_df, profiles, X, ids, id2idx,
+    faiss_index=None, faiss_ids=None, topk_list=(10,50,100),
+    use_faiss_rerank=False, expand_rq_M=2, expand_vq_T=3
 ):
     is_vq = (codebooks.ndim == 2)  # [K,d]
-    L = None if is_vq else codebooks.shape[0]
-
     results = {f"Recall@{k}": 0.0 for k in topk_list}
     results.update({f"NDCG@{k}": 0.0 for k in topk_list})
     n_eval = 0
     n_cold = 0
     cand_sizes = []
 
-    import faiss
+    # 尝试导入 faiss（用于候选内部的重排或全库回退），缺失则自动回退
+    try:
+        import faiss  # noqa: F401
+        has_faiss = faiss_index is not None
+    except Exception:
+        has_faiss = False
 
     for _, row in test_df.iterrows():
         u = row["user_id"]
@@ -88,46 +117,56 @@ def evaluate_method(
             continue
         z_u = profiles[u]  # [d]
 
-        # 1) 候选：倒排
+        # ---------- 1) 生成候选：倒排 + 并集扩展 ----------
+        cand_keys = set()
         if is_vq:
             tok = vq_quantize(z_u, codebooks)
-            key = code_key_from_codes(tok)
+            for t in topM_neighbors(codebooks, tok, M=max(1, expand_vq_T)):
+                cand_keys.add(str(int(t)))
         else:
-            codes = rq_quantize(z_u, codebooks)
-            key = code_key_from_codes(codes)
-        cands = inverted.get(key, [])
+            base_codes = rq_quantize(z_u, codebooks)  # list len=L
+            L = codebooks.shape[0]
+            for l in range(L):
+                C = codebooks[l]
+                for t in topM_neighbors(C, base_codes[l], M=max(1, expand_rq_M)):
+                    alt = list(base_codes); alt[l] = int(t)
+                    cand_keys.add("-".join(map(str, alt)))
 
-        # 2) 重排
+        # 倒排并集
+        cands = []
+        for k in cand_keys:
+            cands.extend(inverted.get(k, []))
+        # 去重（保序）
+        cands = list(dict.fromkeys(cands))
+
+        # ---------- 2) 重排 ----------
         topk = max(topk_list)
         if len(cands) == 0:
-            # 回退：FAISS 全库近邻（Approximate）
-            if faiss_index is None:
-                # 退而求其次：全量点积（慢，但最简）
+            # 回退：全库近邻
+            if has_faiss:
+                q = z_u.astype(np.float32)[None, :]
+                D, I = faiss_index.search(q, topk)  # type: ignore
+                ranked_ids = [str(faiss_ids[i]) for i in I[0]]
+            else:
                 scores = X @ z_u
                 idxs = np.argsort(-scores)[:topk]
-                ranked_ids = [faiss_ids[i] if faiss_ids is not None else None for i in idxs]
-                # 如果没有 faiss_ids，直接从 id2idx 的 keys 无序拿不到，还是建议提前传 faiss 索引
-            else:
-                q = z_u.astype(np.float32)[None, :]
-                D, I = faiss_index.search(q, topk)
-                ranked_ids = [str(faiss_ids[i]) for i in I[0]]
+                ranked_ids = [str(ids[i]) for i in idxs]
         else:
             cand_sizes.append(len(cands))
             cand_idx = [id2idx[i] for i in cands if i in id2idx]
             if not cand_idx:
-                # 极端情况：倒排有id但无向量（不太可能）
-                if faiss_index is None:
+                if has_faiss:
+                    q = z_u.astype(np.float32)[None, :]
+                    D, I = faiss_index.search(q, topk)  # type: ignore
+                    ranked_ids = [str(faiss_ids[i]) for i in I[0]]
+                else:
                     scores = X @ z_u
                     idxs = np.argsort(-scores)[:topk]
-                    ranked_ids = [faiss_ids[i] if faiss_ids is not None else None for i in idxs]
-                else:
-                    q = z_u.astype(np.float32)[None, :]
-                    D, I = faiss_index.search(q, topk)
-                    ranked_ids = [str(faiss_ids[i]) for i in I[0]]
+                    ranked_ids = [str(ids[i]) for i in idxs]
             else:
                 V = X[cand_idx]  # [C,d]
-                if use_faiss_rerank and len(cand_idx) > 1:
-                    # 临时建一个小索引做“FAISS重排”
+                if use_faiss_rerank and len(cand_idx) > 1 and has_faiss:
+                    import faiss  # type: ignore
                     d = V.shape[1]
                     sub = faiss.IndexFlatIP(d)
                     sub.add(V.astype(np.float32))
@@ -135,14 +174,12 @@ def evaluate_method(
                     D, I = sub.search(q, min(topk, len(cand_idx)))
                     take = [cand_idx[i] for i in I[0]]
                 else:
-                    # 直接点积重排
                     scores = V @ z_u
                     order = np.argsort(-scores)[:topk]
                     take = [cand_idx[i] for i in order]
-                ranked_ids = [list(id2idx.keys())[list(id2idx.values()).index(i)] for i in take]  # 慢但简洁
-                # 更快：直接由 ids 数组取：我们没有 ids 数组？可以不转换，后面比较用 id2idx 位置也行
+                ranked_ids = [str(ids[i]) for i in take]
 
-        # 3) 计算指标
+        # ---------- 3) 指标 ----------
         try:
             rank = ranked_ids.index(gt)
         except ValueError:
@@ -164,11 +201,13 @@ def evaluate_method(
         "evaluated": n_eval,
         "cold_start_skipped": n_cold,
         "avg_cand_size": (sum(cand_sizes)/len(cand_sizes) if cand_sizes else 0.0),
+        "expand_rq_M": expand_rq_M,
+        "expand_vq_T": expand_vq_T,
     })
     return results
 
 def main():
-    ap = argparse.ArgumentParser(description="Offline eval: inverted candidates + FAISS rerank")
+    ap = argparse.ArgumentParser(description="Offline eval: inverted candidates + FAISS rerank + expansions")
     ap.add_argument("--train", required=True)
     ap.add_argument("--valid", required=True)
     ap.add_argument("--test", required=True)
@@ -179,6 +218,15 @@ def main():
     ap.add_argument("--methods", nargs="+", required=True,
                     help="Method names under outputs/, e.g. rqkmeans_4x256 rqvae_4x256 vqvae_4096")
     ap.add_argument("--use-faiss-rerank", action="store_true")
+
+    # 新增：用户画像
+    ap.add_argument("--profile", choices=["mean","last","lastN"], default="lastN")
+    ap.add_argument("--lastN", type=int, default=5)
+
+    # 新增：候选扩展
+    ap.add_argument("--expand-rq-M", type=int, default=2, help="RQ: each level take top-M neighbors (union).")
+    ap.add_argument("--expand-vq-T", type=int, default=3, help="VQ: take top-T nearest codewords (union).")
+
     ap.add_argument("--max-test", type=int, default=None, help="Subsample test rows for quick run")
     ap.add_argument("--out", default="./results/offline_eval.csv")
     args = ap.parse_args()
@@ -194,15 +242,21 @@ def main():
     X, ids, id2idx = load_items_emb(args.items_emb, args.items_ids, normalize=True)
 
     # 用户画像
-    profiles = build_user_profiles(train, valid, id2idx, X)
+    profiles = build_user_profiles(
+        train, valid, id2idx, X,
+        strategy=args.profile, lastN=args.lastN
+    )
 
-    # FAISS（全库回退）
+    # FAISS（若可用）；若 build_faiss 落盘了 NO_FAISS 则自动放弃
     faiss_index = None
     faiss_ids = None
-    if os.path.exists(args.faiss_index):
-        import faiss
-        faiss_index = faiss.read_index(args.faiss_index)
-        faiss_ids = np.load(args.faiss_ids, allow_pickle=True)
+    if os.path.exists(args.faiss_index) and not os.path.exists(os.path.join(os.path.dirname(args.faiss_index), "NO_FAISS")):
+        try:
+            import faiss
+            faiss_index = faiss.read_index(args.faiss_index)
+            faiss_ids = np.load(args.faiss_ids, allow_pickle=True)
+        except Exception as e:
+            print("[WARN] Failed to load FAISS, will fallback to NumPy search. Reason:", e)
 
     # 评测每个方法
     rows = []
@@ -225,11 +279,12 @@ def main():
             inverted=inverted,
             test_df=test,
             profiles=profiles,
-            X=X,
-            id2idx=id2idx,
+            X=X, ids=ids, id2idx=id2idx,
             faiss_index=faiss_index,
             faiss_ids=faiss_ids,
             use_faiss_rerank=args.use_faiss_rerank,
+            expand_rq_M=args.expand_rq_M,
+            expand_vq_T=args.expand_vq_T,
         )
         print(f"{name}: {json.dumps(res, indent=2)}")
         row = {"method": name}

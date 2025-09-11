@@ -28,14 +28,23 @@ def main():
         n = np.linalg.norm(X, axis=1, keepdims=True) + 1e-9
         X = X / n
 
-    import faiss
-    d = X.shape[1]
-    index = faiss.IndexFlatIP(d)
-    index.add(X)
-
-    faiss.write_index(index, os.path.join(args.outdir, "index.faiss"))
-    np.save(os.path.join(args.outdir, "ids.npy"), ids)
-    print(f"Saved FAISS -> {os.path.join(args.outdir, 'index.faiss')}  (N={len(ids)}, d={d})")
+    # ---- 尝试使用 FAISS；失败则回退为 NumPy 数组落盘 ----
+    try:
+        import faiss
+        d = X.shape[1]
+        index = faiss.IndexFlatIP(d)
+        index.add(X.astype(np.float32))
+        faiss.write_index(index, os.path.join(args.outdir, "index.faiss"))
+        np.save(os.path.join(args.outdir, "ids.npy"), ids)
+        print(f"Saved FAISS -> {os.path.join(args.outdir, 'index.faiss')}  (N={len(ids)}, d={d})")
+    except Exception as e:
+        # 回退：保存原始数组 + 哨兵文件
+        np.save(os.path.join(args.outdir, "X.npy"), X.astype(np.float32))
+        np.save(os.path.join(args.outdir, "ids.npy"), ids)
+        with open(os.path.join(args.outdir, "NO_FAISS"), "w") as f:
+            f.write(str(e))
+        print("[WARN] FAISS unavailable; saved raw arrays for fallback.")
+        print("Reason:", e)
 
 if __name__ == "__main__":
     main()
