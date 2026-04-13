@@ -31,7 +31,6 @@ from typing import Tuple, Optional, Dict
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -166,11 +165,16 @@ def train_vqvae(
 
 
 @torch.no_grad()
-def encode_vqvae(quant: VectorQuantizerEMA, Z: torch.Tensor, device: str = "cpu") -> np.ndarray:
+def encode_vqvae(
+    quant: VectorQuantizerEMA,
+    Z: torch.Tensor,
+    device: str = "cpu",
+    batch_size: int = 8192,
+) -> np.ndarray:
     quant.eval()
-    quant.to(device)  # <- 新增
+    quant.to(device)
     all_idx = []
-    for (batch,) in batch_iterator(Z, batch_size=8192, shuffle=False):
+    for (batch,) in batch_iterator(Z, batch_size=batch_size, shuffle=False):
         batch = batch.to(device)
         _, idx, _ = quant(batch)
         all_idx.append(idx.detach().cpu().numpy()[:, None])  # N×1
@@ -229,19 +233,21 @@ def train_rqvae(
 
 
 @torch.no_grad()
-def encode_rq(rq: ResidualQuantizer, Z: torch.Tensor, device: str = "cpu") -> np.ndarray:
+def encode_rq(
+    rq: ResidualQuantizer,
+    Z: torch.Tensor,
+    device: str = "cpu",
+    batch_size: int = 8192,
+) -> np.ndarray:
     rq.eval()
-    L = rq.L
+    rq.to(device)
     codes = []
-    for (batch,) in batch_iterator(Z, batch_size=8192, shuffle=False):
+    for (batch,) in batch_iterator(Z, batch_size=batch_size, shuffle=False):
         batch = batch.to(device)
         residual = batch
         codes_b = []
         for C in rq.codebooks:
-            # 最近邻索引
-            dist = (residual.pow(2).sum(1, keepdim=True) - 2 * residual @ C.t() + C.pow(2).sum(1))
-            idx = torch.argmin(dist, dim=1)
-            q = C[idx]
+            idx, q = rq._argmin_chunked(residual, C)
             residual = residual - q
             codes_b.append(idx.detach().cpu().numpy())
         codes.append(np.stack(codes_b, axis=1))  # (L, N_b) → N_b×L
@@ -277,6 +283,7 @@ def main():
     parser.add_argument("--max-train", type=int, default=None, help="Subsample rows for training.")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8192)
+    parser.add_argument("--encode-batch-size", type=int, default=8192)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--K", type=int, default=256)
     parser.add_argument("--L", type=int, default=4)
@@ -366,9 +373,15 @@ def main():
             # 仅编码：加载 codebook
             npz = np.load(args.load)
             codebook = npz["codebooks"]  # [K, d]
-            quant = VectorQuantizerEMA(K=codebook.shape[0], d=codebook.shape[1])
+            quant = VectorQuantizerEMA(
+                K=codebook.shape[0],
+                d=codebook.shape[1],
+                beta=args.beta,
+                decay=args.decay,
+                k_chunk=args.dist_chunk,
+            )
             with torch.no_grad():
-                quant.codebook.data.copy_(torch.tensor(codebook))
+                quant.init_codebook(torch.tensor(codebook))
         else:
             if Z_train is None:
                 raise ValueError("vqvae requires training data unless --no-train with --load is used.")
@@ -383,12 +396,18 @@ def main():
 
         # 构造量化器用于编码        
         if "quant" not in locals():
-            quant = VectorQuantizerEMA(K=codebook.shape[0], d=codebook.shape[1]).to(device)   # <- 加 .to(device)
+            quant = VectorQuantizerEMA(
+                K=codebook.shape[0],
+                d=codebook.shape[1],
+                beta=args.beta,
+                decay=args.decay,
+                k_chunk=args.dist_chunk,
+            ).to(device)
             with torch.no_grad():
-                quant.codebook.data.copy_(torch.tensor(codebook, device=device))              # <- 指定 device
+                quant.init_codebook(torch.tensor(codebook, device=device))
 
 
-        codes = encode_vqvae(quant, Z_encode, device=device)
+        codes = encode_vqvae(quant, Z_encode, device=device, batch_size=args.encode_batch_size)
         save_codes(args.out, codes)
         metrics.update({"K": int(quant.codebook.shape[0]), "embedding_dim": int(quant.codebook.shape[1]), "encoded": int(codes.shape[0])})
         write_metrics(args.out, metrics)
@@ -433,7 +452,7 @@ def main():
                     cb.copy_(torch.tensor(loaded[i]))
             rq = rq.to(device)
 
-        codes = encode_rq(rq, Z_encode, device=device)
+        codes = encode_rq(rq, Z_encode, device=device, batch_size=args.encode_batch_size)
         save_codes(args.out, codes)
         # 导出 L/K/d
         with torch.no_grad():

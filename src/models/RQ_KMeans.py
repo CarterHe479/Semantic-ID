@@ -5,6 +5,7 @@ from sklearn.cluster import KMeans
 class ResidualKMeans:
     def __init__(self, L=4, K=256, random_state=0):
         self.L, self.K = L, K
+        self.random_state = random_state
         self.codebooks = []
 
     def fit(self, Z):
@@ -12,7 +13,7 @@ class ResidualKMeans:
         residual = Z.copy()
         self.codebooks = []
         for _ in range(self.L):
-            km = KMeans(n_clusters=self.K, n_init="auto", random_state=0).fit(residual)
+            km = KMeans(n_clusters=self.K, n_init="auto", random_state=self.random_state).fit(residual)
             C = km.cluster_centers_.astype(np.float32, copy=False)
             idx = km.predict(residual)
             Q = C[idx]

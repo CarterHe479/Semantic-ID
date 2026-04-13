@@ -1,6 +1,10 @@
 # src/retrieval/build_faiss.py
 # -*- coding: utf-8 -*-
-import argparse, os, numpy as np, torch
+import argparse
+import json
+import os
+import numpy as np
+import torch
 from pathlib import Path
 
 def load_emb(path):
@@ -36,11 +40,15 @@ def main():
         index.add(X.astype(np.float32))
         faiss.write_index(index, os.path.join(args.outdir, "index.faiss"))
         np.save(os.path.join(args.outdir, "ids.npy"), ids)
+        with open(os.path.join(args.outdir, "meta.json"), "w") as f:
+            json.dump({"normalize": bool(args.normalize), "items": int(len(ids)), "dim": int(d)}, f, indent=2)
         print(f"Saved FAISS -> {os.path.join(args.outdir, 'index.faiss')}  (N={len(ids)}, d={d})")
     except Exception as e:
         # 回退：保存原始数组 + 哨兵文件
         np.save(os.path.join(args.outdir, "X.npy"), X.astype(np.float32))
         np.save(os.path.join(args.outdir, "ids.npy"), ids)
+        with open(os.path.join(args.outdir, "meta.json"), "w") as f:
+            json.dump({"normalize": bool(args.normalize), "items": int(len(ids)), "dim": int(X.shape[1])}, f, indent=2)
         with open(os.path.join(args.outdir, "NO_FAISS"), "w") as f:
             f.write(str(e))
         print("[WARN] FAISS unavailable; saved raw arrays for fallback.")

@@ -16,6 +16,7 @@ venv/
 data/
 outputs/
 logs/
+results/*.csv
 checkpoints/
 tmp/
 
@@ -26,4 +27,3 @@ tmp/
 
 # Jupyter
 .ipynb_checkpoints/
-EOF

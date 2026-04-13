@@ -3,7 +3,6 @@
 import argparse, os, pickle, math, json
 from pathlib import Path
 import numpy as np
-import pandas as pd
 import torch
 
 def l2norm(x, axis=1, eps=1e-9):
@@ -59,6 +58,8 @@ def topM_neighbors(C, center_idx, M=2):
 
 def build_user_profiles(train_df, valid_df, id2idx, X, id_col="item_id", user_col="user_id",
                         strategy="lastN", lastN=5):
+    import pandas as pd
+
     # 合并历史，尽量按 timestamp 排序；缺失就用原顺序
     cols = [user_col, id_col]
     if "timestamp" in train_df.columns: cols.append("timestamp")
@@ -93,13 +94,17 @@ def ndcg_at_k(rank, k):
 def evaluate_method(
     name, codebooks, inverted, test_df, profiles, X, ids, id2idx,
     faiss_index=None, faiss_ids=None, topk_list=(10,50,100),
-    use_faiss_rerank=False, expand_rq_M=2, expand_vq_T=3
+    use_faiss_rerank=False, expand_rq_M=2, expand_vq_T=3,
+    allow_full_search_fallback=False,
 ):
     is_vq = (codebooks.ndim == 2)  # [K,d]
     results = {f"Recall@{k}": 0.0 for k in topk_list}
     results.update({f"NDCG@{k}": 0.0 for k in topk_list})
     n_eval = 0
     n_cold = 0
+    n_empty_candidates = 0
+    n_unmapped_candidates = 0
+    n_full_search_fallback = 0
     cand_sizes = []
 
     # 尝试导入 faiss（用于候选内部的重排或全库回退），缺失则自动回退
@@ -141,13 +146,16 @@ def evaluate_method(
 
         # ---------- 2) 重排 ----------
         topk = max(topk_list)
+        ranked_ids = []
         if len(cands) == 0:
-            # 回退：全库近邻
-            if has_faiss:
+            n_empty_candidates += 1
+            if allow_full_search_fallback and has_faiss:
+                n_full_search_fallback += 1
                 q = z_u.astype(np.float32)[None, :]
                 D, I = faiss_index.search(q, topk)  # type: ignore
                 ranked_ids = [str(faiss_ids[i]) for i in I[0]]
-            else:
+            elif allow_full_search_fallback:
+                n_full_search_fallback += 1
                 scores = X @ z_u
                 idxs = np.argsort(-scores)[:topk]
                 ranked_ids = [str(ids[i]) for i in idxs]
@@ -155,11 +163,14 @@ def evaluate_method(
             cand_sizes.append(len(cands))
             cand_idx = [id2idx[i] for i in cands if i in id2idx]
             if not cand_idx:
-                if has_faiss:
+                n_unmapped_candidates += 1
+                if allow_full_search_fallback and has_faiss:
+                    n_full_search_fallback += 1
                     q = z_u.astype(np.float32)[None, :]
                     D, I = faiss_index.search(q, topk)  # type: ignore
                     ranked_ids = [str(faiss_ids[i]) for i in I[0]]
-                else:
+                elif allow_full_search_fallback:
+                    n_full_search_fallback += 1
                     scores = X @ z_u
                     idxs = np.argsort(-scores)[:topk]
                     ranked_ids = [str(ids[i]) for i in idxs]
@@ -200,6 +211,11 @@ def evaluate_method(
     results.update({
         "evaluated": n_eval,
         "cold_start_skipped": n_cold,
+        "empty_candidate_queries": n_empty_candidates,
+        "unmapped_candidate_queries": n_unmapped_candidates,
+        "full_search_fallback_queries": n_full_search_fallback,
+        "empty_candidate_rate": n_empty_candidates / n_eval,
+        "full_search_fallback_rate": n_full_search_fallback / n_eval,
         "avg_cand_size": (sum(cand_sizes)/len(cand_sizes) if cand_sizes else 0.0),
         "expand_rq_M": expand_rq_M,
         "expand_vq_T": expand_vq_T,
@@ -217,7 +233,12 @@ def main():
     ap.add_argument("--faiss-ids",    default="./outputs/faiss/ids.npy")
     ap.add_argument("--methods", nargs="+", required=True,
                     help="Method names under outputs/, e.g. rqkmeans_4x256 rqvae_4x256 vqvae_4096")
+    ap.add_argument("--outputs-root", default="outputs",
+                    help="Root directory that contains method output folders.")
     ap.add_argument("--use-faiss-rerank", action="store_true")
+    ap.add_argument("--allow-full-search-fallback", action="store_true",
+                    help="If set, empty semantic-ID candidates fall back to full dense search. "
+                         "Default is to count them as misses.")
 
     # 新增：用户画像
     ap.add_argument("--profile", choices=["mean","last","lastN"], default="lastN")
@@ -230,6 +251,8 @@ def main():
     ap.add_argument("--max-test", type=int, default=None, help="Subsample test rows for quick run")
     ap.add_argument("--out", default="./results/offline_eval.csv")
     args = ap.parse_args()
+
+    import pandas as pd
 
     # 数据
     train = pd.read_parquet(args.train)
@@ -255,13 +278,19 @@ def main():
             import faiss
             faiss_index = faiss.read_index(args.faiss_index)
             faiss_ids = np.load(args.faiss_ids, allow_pickle=True)
+            meta_path = os.path.join(os.path.dirname(args.faiss_index), "meta.json")
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    faiss_meta = json.load(f)
+                if not faiss_meta.get("normalize", False):
+                    print("[WARN] FAISS index was built without --normalize, but eval uses normalized item/user vectors.")
         except Exception as e:
             print("[WARN] Failed to load FAISS, will fallback to NumPy search. Reason:", e)
 
     # 评测每个方法
     rows = []
     for name in args.methods:
-        base = os.path.join("outputs", name)
+        base = os.path.join(args.outputs_root, name)
         inv_path = os.path.join(base, "inverted.pkl")
         cb_path  = os.path.join(base, "codebooks.npz")
 
@@ -285,6 +314,7 @@ def main():
             use_faiss_rerank=args.use_faiss_rerank,
             expand_rq_M=args.expand_rq_M,
             expand_vq_T=args.expand_vq_T,
+            allow_full_search_fallback=args.allow_full_search_fallback,
         )
         print(f"{name}: {json.dumps(res, indent=2)}")
         row = {"method": name}

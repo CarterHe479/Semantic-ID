@@ -1,5 +1,7 @@
 # src/models/vq_vae.py
-import torch, torch.nn as nn, torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 class VectorQuantizerEMA(nn.Module):
     """
@@ -12,8 +14,17 @@ class VectorQuantizerEMA(nn.Module):
         self.K, self.d, self.beta, self.decay, self.eps = K, d, beta, decay, eps
         self.k_chunk = max(1, int(k_chunk))
         self.codebook = nn.Parameter(torch.randn(K, d))
-        self.register_buffer("ema_cluster_size", torch.zeros(K))
-        self.register_buffer("ema_weight", torch.randn(K, d))
+        self.register_buffer("ema_cluster_size", torch.ones(K))
+        self.register_buffer("ema_weight", self.codebook.detach().clone())
+
+    @torch.no_grad()
+    def init_codebook(self, codebook: torch.Tensor):
+        codebook = codebook.to(device=self.codebook.device, dtype=self.codebook.dtype)
+        if tuple(codebook.shape) != tuple(self.codebook.shape):
+            raise ValueError(f"Expected codebook shape {tuple(self.codebook.shape)}, got {tuple(codebook.shape)}")
+        self.codebook.copy_(codebook)
+        self.ema_cluster_size.fill_(1.0)
+        self.ema_weight.copy_(codebook)
 
     def _argmin_chunked(self, z_e: torch.Tensor):
         """
@@ -52,20 +63,21 @@ class VectorQuantizerEMA(nn.Module):
         idx, _ = self._argmin_chunked(z_e)
         z_q = self.codebook.index_select(0, idx)
 
-        # 2) EMA 更新，不用 one-hot
-        with torch.no_grad():
-            decay, eps = self.decay, self.eps
-            counts = torch.bincount(idx, minlength=self.K).to(z_e.dtype)   # [K]
-            self.ema_cluster_size.mul_(decay).add_(counts, alpha=1-decay)
+        # 2) EMA 更新，不用 one-hot。推理/编码时必须保持码本不变。
+        if self.training:
+            with torch.no_grad():
+                decay, eps = self.decay, self.eps
+                counts = torch.bincount(idx, minlength=self.K).to(z_e.dtype)   # [K]
+                self.ema_cluster_size.mul_(decay).add_(counts, alpha=1-decay)
 
-            dw = torch.zeros_like(self.ema_weight)                         # [K,d]
-            dw.index_add_(0, idx, z_e)                                     # sum z_e per code
-            self.ema_weight.mul_(decay).add_(dw, alpha=1-decay)
+                dw = torch.zeros_like(self.ema_weight)                         # [K,d]
+                dw.index_add_(0, idx, z_e)                                     # sum z_e per code
+                self.ema_weight.mul_(decay).add_(dw, alpha=1-decay)
 
-            n = self.ema_cluster_size.sum()
-            cluster_size = (self.ema_cluster_size + eps) / (n + self.K*eps) * n  # smooth
-            new_codebook = self.ema_weight / cluster_size.unsqueeze(1)
-            self.codebook.data.copy_(new_codebook)
+                n = self.ema_cluster_size.sum()
+                cluster_size = (self.ema_cluster_size + eps) / (n + self.K*eps) * n  # smooth
+                new_codebook = self.ema_weight / cluster_size.unsqueeze(1)
+                self.codebook.copy_(new_codebook)
 
         # 3) STE & commitment
         z_q_ste = z_e + (z_q - z_e).detach()
