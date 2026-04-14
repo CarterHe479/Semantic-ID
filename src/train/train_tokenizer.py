@@ -32,6 +32,7 @@ from typing import Tuple, Optional, Dict
 import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.cluster import MiniBatchKMeans
 from torch.utils.data import DataLoader, TensorDataset
 
 # 依赖你此前放在 src/models 下的实现
@@ -54,6 +55,13 @@ def ensure_dir(path: str):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
+def safe_torch_load(path: str, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def load_embeddings(path: str, max_rows: Optional[int] = None) -> torch.Tensor:
     """
     支持 .pt / .npy / .npz
@@ -61,7 +69,7 @@ def load_embeddings(path: str, max_rows: Optional[int] = None) -> torch.Tensor:
     """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pt":
-        obj = torch.load(path, map_location="cpu")
+        obj = safe_torch_load(path, map_location="cpu")
         if isinstance(obj, torch.Tensor):
             Z = obj
         elif isinstance(obj, dict):
@@ -123,6 +131,28 @@ def batch_iterator(Z: torch.Tensor, batch_size: int, shuffle: bool = True):
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
 
 
+def init_vq_codebook_kmeans(Z: torch.Tensor, K: int, seed: int = 42) -> np.ndarray:
+    X = Z.detach().cpu().numpy().astype(np.float32, copy=False)
+    if X.shape[0] == 0:
+        raise ValueError("Cannot initialize VQ codebook from empty embeddings.")
+
+    k_fit = min(K, X.shape[0])
+    km = MiniBatchKMeans(
+        n_clusters=k_fit,
+        random_state=seed,
+        n_init=3,
+        batch_size=max(1024, min(X.shape[0], k_fit * 8)),
+        reassignment_ratio=0.01,
+    )
+    km.fit(X)
+    centers = km.cluster_centers_.astype(np.float32, copy=False)
+    if k_fit == K:
+        return centers
+
+    extra_idx = np.random.default_rng(seed).choice(X.shape[0], size=K - k_fit, replace=True)
+    return np.concatenate([centers, X[extra_idx]], axis=0).astype(np.float32, copy=False)
+
+
 # -------------------------
 # Trainers
 # -------------------------
@@ -135,15 +165,31 @@ def train_vqvae(
     batch_size: int = 8192,
     device: str = "cpu",
     k_chunk: int = 1024,
+    init_method: str = "kmeans",
+    seed: int = 42,
+    restart_unused_codes: bool = True,
+    restart_threshold: float = 0.25,
 ) -> Tuple[VectorQuantizerEMA, Dict]:
     """
     轻量 VQ-VAE 训练：仅量化器 + 承诺损失 + (z_q 与 z_e 的重构 MSE)
     采用 EMA 更新码本，无需 optimizer。
     """
     # quant = VectorQuantizerEMA(K=K, d=Z.shape[1], beta=beta, decay=decay).to(device)
-    quant = VectorQuantizerEMA(K=K, d=Z.shape[1], beta=beta, decay=decay, k_chunk=k_chunk).to(device)
+    quant = VectorQuantizerEMA(
+        K=K,
+        d=Z.shape[1],
+        beta=beta,
+        decay=decay,
+        k_chunk=k_chunk,
+        restart_unused_codes=restart_unused_codes,
+        restart_threshold=restart_threshold,
+    ).to(device)
+    if init_method == "kmeans":
+        print(f"[VQ-VAE] initializing codebook with MiniBatchKMeans K={K}")
+        codebook = init_vq_codebook_kmeans(Z, K=K, seed=seed)
+        quant.init_codebook(torch.from_numpy(codebook).to(device))
     quant.train()
-    metrics = {"epoch_losses": []}
+    metrics = {"epoch_losses": [], "usage": []}
 
     for ep in range(epochs):
         running = 0.0
@@ -157,11 +203,13 @@ def train_vqvae(
             running += loss.item() * batch.size(0)
             n += batch.size(0)
         metrics["epoch_losses"].append(running / max(n, 1))
-        print(f"[VQ-VAE] epoch {ep+1}/{epochs} loss={metrics['epoch_losses'][-1]:.6f}")
+        used = int((quant.ema_cluster_size.detach().cpu() > 1.0).sum().item())
+        metrics["usage"].append(used)
+        print(f"[VQ-VAE] epoch {ep+1}/{epochs} loss={metrics['epoch_losses'][-1]:.6f} used_codes~={used}/{K}")
 
     # 导出 codebook
     codebook = quant.codebook.detach().cpu().numpy()
-    return quant, {"loss": metrics["epoch_losses"][-1], "codebook": codebook}
+    return quant, {"loss": metrics["epoch_losses"][-1], "codebook": codebook, "usage": metrics["usage"]}
 
 
 @torch.no_grad()
@@ -290,6 +338,13 @@ def main():
     parser.add_argument("--beta", type=float, default=0.25)
     parser.add_argument("--entropy-reg", type=float, default=1e-4)
     parser.add_argument("--decay", type=float, default=0.99, help="EMA decay for VQ-VAE.")
+    parser.add_argument("--vq-init", choices=["kmeans", "random"], default="kmeans",
+                        help="Codebook initialization for VQ-VAE.")
+    parser.add_argument("--vq-restart-unused", action="store_true", default=True,
+                        help="Restart long-unused VQ codes from current batches.")
+    parser.add_argument("--no-vq-restart-unused", dest="vq_restart_unused", action="store_false",
+                        help="Disable VQ dead-code restart.")
+    parser.add_argument("--vq-restart-threshold", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--no-train", action="store_true", help="Skip training and only encode using --load.")
@@ -379,6 +434,8 @@ def main():
                 beta=args.beta,
                 decay=args.decay,
                 k_chunk=args.dist_chunk,
+                restart_unused_codes=args.vq_restart_unused,
+                restart_threshold=args.vq_restart_threshold,
             )
             with torch.no_grad():
                 quant.init_codebook(torch.tensor(codebook))
@@ -387,10 +444,14 @@ def main():
                 raise ValueError("vqvae requires training data unless --no-train with --load is used.")
             quant, train_out = train_vqvae(
                 Z_train, K=args.K, beta=args.beta, decay=args.decay,
-                epochs=args.epochs, batch_size=args.batch_size, device=device, k_chunk=args.dist_chunk
+                epochs=args.epochs, batch_size=args.batch_size, device=device,
+                k_chunk=args.dist_chunk, init_method=args.vq_init, seed=args.seed,
+                restart_unused_codes=args.vq_restart_unused,
+                restart_threshold=args.vq_restart_threshold
             )
             codebook = train_out["codebook"]
             metrics["loss"] = float(train_out["loss"])
+            metrics["usage"] = train_out.get("usage", [])
             save_codebooks_npz(args.out, codebook)
             print(f"Saved codebook -> {os.path.join(args.out, 'codebooks.npz')}")
 
@@ -402,6 +463,8 @@ def main():
                 beta=args.beta,
                 decay=args.decay,
                 k_chunk=args.dist_chunk,
+                restart_unused_codes=args.vq_restart_unused,
+                restart_threshold=args.vq_restart_threshold,
             ).to(device)
             with torch.no_grad():
                 quant.init_codebook(torch.tensor(codebook, device=device))

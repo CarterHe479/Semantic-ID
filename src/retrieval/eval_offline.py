@@ -10,7 +10,10 @@ def l2norm(x, axis=1, eps=1e-9):
     return x / n
 
 def load_items_emb(emb_path, ids_path, normalize=True):
-    obj = torch.load(emb_path, map_location="cpu")
+    try:
+        obj = torch.load(emb_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        obj = torch.load(emb_path, map_location="cpu")
     X = (obj["emb"] if isinstance(obj, dict) else obj).float().numpy()
     ids = np.load(ids_path, allow_pickle=True).astype(str)
     assert X.shape[0] == len(ids)
@@ -44,6 +47,23 @@ def code_key_from_codes(codes):
     if isinstance(codes, (list, tuple)):
         return "-".join(str(int(x)) for x in codes)
     return str(int(codes))
+
+
+def parse_levels(text):
+    if text is None or str(text).strip() == "":
+        return []
+    return sorted({int(x) for x in str(text).split(",") if str(x).strip()})
+
+
+def normalize_inverted(payload):
+    if isinstance(payload, dict) and payload.get("schema_version") == 2:
+        return payload
+    return {
+        "schema_version": 1,
+        "type": "legacy",
+        "exact": payload,
+        "prefix": {},
+    }
 
 def topM_neighbors(C, center_idx, M=2):
     """
@@ -96,7 +116,9 @@ def evaluate_method(
     faiss_index=None, faiss_ids=None, topk_list=(10,50,100),
     use_faiss_rerank=False, expand_rq_M=2, expand_vq_T=3,
     allow_full_search_fallback=False,
+    rq_prefix_levels=(1, 2),
 ):
+    inverted = normalize_inverted(inverted)
     is_vq = (codebooks.ndim == 2)  # [K,d]
     results = {f"Recall@{k}": 0.0 for k in topk_list}
     results.update({f"NDCG@{k}": 0.0 for k in topk_list})
@@ -124,6 +146,7 @@ def evaluate_method(
 
         # ---------- 1) 生成候选：倒排 + 并集扩展 ----------
         cand_keys = set()
+        prefix_keys = set()
         if is_vq:
             tok = vq_quantize(z_u, codebooks)
             for t in topM_neighbors(codebooks, tok, M=max(1, expand_vq_T)):
@@ -131,16 +154,27 @@ def evaluate_method(
         else:
             base_codes = rq_quantize(z_u, codebooks)  # list len=L
             L = codebooks.shape[0]
+            for level in rq_prefix_levels:
+                if 1 <= level <= L:
+                    prefix_keys.add("-".join(str(int(x)) for x in base_codes[:level]))
             for l in range(L):
                 C = codebooks[l]
                 for t in topM_neighbors(C, base_codes[l], M=max(1, expand_rq_M)):
                     alt = list(base_codes); alt[l] = int(t)
                     cand_keys.add("-".join(map(str, alt)))
+                    for level in rq_prefix_levels:
+                        if 1 <= level <= L and l < level:
+                            prefix_keys.add("-".join(str(int(x)) for x in alt[:level]))
 
         # 倒排并集
         cands = []
         for k in cand_keys:
-            cands.extend(inverted.get(k, []))
+            cands.extend(inverted["exact"].get(k, []))
+        if prefix_keys:
+            prefix_indexes = inverted.get("prefix", {})
+            for k in prefix_keys:
+                level = len(k.split("-"))
+                cands.extend(prefix_indexes.get(level, {}).get(k, []))
         # 去重（保序）
         cands = list(dict.fromkeys(cands))
 
@@ -219,6 +253,7 @@ def evaluate_method(
         "avg_cand_size": (sum(cand_sizes)/len(cand_sizes) if cand_sizes else 0.0),
         "expand_rq_M": expand_rq_M,
         "expand_vq_T": expand_vq_T,
+        "rq_prefix_levels": ",".join(map(str, rq_prefix_levels)),
     })
     return results
 
@@ -247,6 +282,8 @@ def main():
     # 新增：候选扩展
     ap.add_argument("--expand-rq-M", type=int, default=2, help="RQ: each level take top-M neighbors (union).")
     ap.add_argument("--expand-vq-T", type=int, default=3, help="VQ: take top-T nearest codewords (union).")
+    ap.add_argument("--rq-prefix-levels", default="1,2",
+                    help="Comma-separated RQ prefix levels to use as coarse recall buckets, e.g. '1,2'.")
 
     ap.add_argument("--max-test", type=int, default=None, help="Subsample test rows for quick run")
     ap.add_argument("--out", default="./results/offline_eval.csv")
@@ -289,6 +326,7 @@ def main():
 
     # 评测每个方法
     rows = []
+    rq_prefix_levels = parse_levels(args.rq_prefix_levels)
     for name in args.methods:
         base = os.path.join(args.outputs_root, name)
         inv_path = os.path.join(base, "inverted.pkl")
@@ -315,6 +353,7 @@ def main():
             expand_rq_M=args.expand_rq_M,
             expand_vq_T=args.expand_vq_T,
             allow_full_search_fallback=args.allow_full_search_fallback,
+            rq_prefix_levels=rq_prefix_levels,
         )
         print(f"{name}: {json.dumps(res, indent=2)}")
         row = {"method": name}

@@ -8,7 +8,10 @@ import torch
 from pathlib import Path
 
 def load_emb(path):
-    obj = torch.load(path, map_location="cpu")
+    try:
+        obj = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        obj = torch.load(path, map_location="cpu")
     if isinstance(obj, dict) and "emb" in obj:
         return obj["emb"].float().numpy()
     if isinstance(obj, torch.Tensor):

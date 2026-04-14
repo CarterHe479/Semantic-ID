@@ -9,10 +9,22 @@ class VectorQuantizerEMA(nn.Module):
     - 距离计算按 codebook 的 K 维分块（k_chunk）进行，避免 B×K×d 广播
     - EMA 更新使用 bincount + index_add_，不再构造 one-hot [B,K]
     """
-    def __init__(self, K=4096, d=256, beta=0.25, decay=0.99, eps=1e-5, k_chunk=1024):
+    def __init__(
+        self,
+        K=4096,
+        d=256,
+        beta=0.25,
+        decay=0.99,
+        eps=1e-5,
+        k_chunk=1024,
+        restart_unused_codes=False,
+        restart_threshold=0.25,
+    ):
         super().__init__()
         self.K, self.d, self.beta, self.decay, self.eps = K, d, beta, decay, eps
         self.k_chunk = max(1, int(k_chunk))
+        self.restart_unused_codes = bool(restart_unused_codes)
+        self.restart_threshold = float(restart_threshold)
         self.codebook = nn.Parameter(torch.randn(K, d))
         self.register_buffer("ema_cluster_size", torch.ones(K))
         self.register_buffer("ema_weight", self.codebook.detach().clone())
@@ -78,6 +90,16 @@ class VectorQuantizerEMA(nn.Module):
                 cluster_size = (self.ema_cluster_size + eps) / (n + self.K*eps) * n  # smooth
                 new_codebook = self.ema_weight / cluster_size.unsqueeze(1)
                 self.codebook.copy_(new_codebook)
+
+                if self.restart_unused_codes and z_e.shape[0] > 0:
+                    dead = (counts == 0) & (self.ema_cluster_size < self.restart_threshold)
+                    n_dead = int(dead.sum().item())
+                    if n_dead > 0:
+                        repl_idx = torch.randint(0, z_e.shape[0], (n_dead,), device=z_e.device)
+                        repl = z_e.index_select(0, repl_idx)
+                        self.codebook[dead].copy_(repl)
+                        self.ema_weight[dead].copy_(repl)
+                        self.ema_cluster_size[dead].fill_(1.0)
 
         # 3) STE & commitment
         z_q_ste = z_e + (z_q - z_e).detach()

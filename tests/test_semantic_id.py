@@ -104,6 +104,43 @@ class EvalFallbackTest(unittest.TestCase):
         self.assertEqual(res["Recall@1"], 1.0)
         self.assertEqual(res["full_search_fallback_queries"], 1)
 
+    def test_rq_prefix_candidates_can_recover_ground_truth(self):
+        pd = require_module("pandas")
+        from src.retrieval.eval_offline import evaluate_method
+
+        X = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+        ids = np.array(["exact_item", "prefix_item"])
+        id2idx = {"exact_item": 0, "prefix_item": 1}
+        profiles = {"u1": np.array([1.0, 0.0], dtype=np.float32)}
+        test_df = pd.DataFrame([{"user_id": "u1", "item_id": "prefix_item"}])
+        codebooks = np.array([
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[1.0, 0.0], [0.0, 1.0]],
+        ], dtype=np.float32)
+        inverted = {
+            "schema_version": 2,
+            "type": "rq",
+            "exact": {"0-0": ["exact_item"]},
+            "prefix": {1: {"0": ["exact_item", "prefix_item"]}},
+        }
+
+        res = evaluate_method(
+            name="rq",
+            codebooks=codebooks,
+            inverted=inverted,
+            test_df=test_df,
+            profiles=profiles,
+            X=X,
+            ids=ids,
+            id2idx=id2idx,
+            topk_list=(1,),
+            expand_rq_M=1,
+            rq_prefix_levels=(1,),
+        )
+
+        self.assertEqual(res["Recall@1"], 1.0)
+        self.assertGreaterEqual(res["avg_cand_size"], 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

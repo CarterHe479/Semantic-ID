@@ -82,6 +82,20 @@ data/amazon23/test.parquet
 
 必需字段：`user_id`, `item_id`, `timestamp`, `title`, `description`。`title` 和 `description` 可为空，脚本会安全转成文本。
 
+如果原始 train/valid/test 中 test 大量用户没有历史，建议先重切分为 user-level leave-one-out：
+
+```bash
+python3 -m src.data.split_interactions \
+  --input "./data/raw/*.parquet" \
+  --outdir ./data/amazon23 \
+  --min-user-interactions 5 \
+  --min-item-interactions 5 \
+  --valid-per-user 1 \
+  --test-per-user 1
+```
+
+目标是让 `cold_start_skipped` 接近 0，并让每个 test 用户在 train/valid 中都有历史。
+
 ### 3090/CUDA 一键运行
 如果你已经准备好真实 parquet 数据，并在 NVIDIA 3090 的 CUDA 环境中运行，可以直接执行：
 
@@ -128,7 +142,7 @@ RQ_BATCH_SIZE=2048 VQ_BATCH_SIZE=4096 ./scripts/run_full_cuda.sh
 TEXT_MODEL=BAAI/bge-small-en-v1.5 ./scripts/run_full_cuda.sh
 ```
 
-VQ-VAE 训练后脚本会打印 token 分布健康度。如果 `unique_tokens` 很低或最大桶接近全库大小，说明 VQ 发生 collapse；这种情况下建议先用 `RUN_VQ=0` 跑 RQ 系列，或者增大 `VQ_K`、增加 `VQ_EPOCHS` 后重新训练。
+VQ-VAE 默认使用 MiniBatchKMeans 初始化码本，并启用 dead-code restart。训练后脚本会打印 token 分布健康度。如果 `unique_tokens` 很低或最大桶接近全库大小，说明 VQ 发生 collapse；这种情况下建议先用 `RUN_VQ=0` 跑 RQ 系列，或者增大 `VQ_K`、增加 `VQ_EPOCHS` 后重新训练。
 
 
 ### 1. 抽取 Item 连续表征（Step 5）
@@ -264,11 +278,13 @@ python -m src.retrieval.eval_offline \
   --faiss-ids   ./outputs/faiss/ids.npy \
   --methods rqkmeans_4x256 rqvae_4x256 vqvae_4096 \
   --use-faiss-rerank \
+  --rq-prefix-levels 1,2 \
   --max-test 5000 \
   --out ./results/offline_eval.csv
 ```
 
 - 结果说明：`offline_eval.csv` 包含每种方法的 Recall@10/50/100、NDCG@10/50/100、平均候选集大小、空候选率、全库回退率等指标。
+- RQ 召回默认会使用 prefix 倒排桶，例如 `c1` 和 `c1-c2`，避免完整 `c1-c2-c3-c4` 精确 code 过细导致候选集接近 1。
 - 默认行为：semantic-ID 候选为空时计为 miss，不再自动回退全库 dense search。若要评测「semantic-ID 候选 + dense fallback」混合策略，可显式添加 `--allow-full-search-fallback`。
 
 
@@ -298,6 +314,18 @@ python3 -m unittest discover -s tests
 
 ### Q3：RQ 系列方法的召回候选集太小，导致 Recall 偏低？
 A：当前倒排索引基于 code 串召回，评测时已支持每层近邻并集扩展。可以增大 `--expand-rq-M` 或 `--expand-vq-T`，也可以适当增大码本大小（如 `--K 512`）。
+
+若 `avg_cand_size` 仍然接近 1，请优先使用更粗的 prefix 召回：
+
+```bash
+python3 -m src.retrieval.eval_offline ... --rq-prefix-levels 1,2 --expand-rq-M 8
+```
+
+也可以尝试更粗的 RQ tokenizer，例如：
+
+```bash
+RQ_L=3 RQ_K=128 RUN_VQ=0 ./scripts/run_full_cuda.sh
+```
 
 
 ## 📊 结果对比参考

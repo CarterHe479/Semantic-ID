@@ -13,12 +13,12 @@ venv/
 *.egg-info/
 
 # 数据与产物（体积大，不入库）
-data/
-outputs/
-logs/
-results/*.csv
-checkpoints/
-tmp/
+/data/
+/outputs*/
+/logs/
+/results/*.csv
+/checkpoints/
+/tmp/
 
 # Hugging Face / Datasets 缓存
 .cache/

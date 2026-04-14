@@ -32,10 +32,13 @@ VQ_EPOCHS="${VQ_EPOCHS:-10}"
 VQ_BATCH_SIZE="${VQ_BATCH_SIZE:-8192}"
 VQ_ENCODE_BATCH_SIZE="${VQ_ENCODE_BATCH_SIZE:-4096}"
 VQ_DIST_CHUNK="${VQ_DIST_CHUNK:-512}"
+VQ_INIT="${VQ_INIT:-kmeans}"
+VQ_RESTART_THRESHOLD="${VQ_RESTART_THRESHOLD:-0.25}"
 
 EVAL_MAX_TEST="${EVAL_MAX_TEST:-5000}"
 EXPAND_RQ_M="${EXPAND_RQ_M:-4}"
 EXPAND_VQ_T="${EXPAND_VQ_T:-8}"
+RQ_PREFIX_LEVELS="${RQ_PREFIX_LEVELS:-1,2}"
 USE_FAISS_RERANK="${USE_FAISS_RERANK:-1}"
 ALLOW_FULL_SEARCH_FALLBACK="${ALLOW_FULL_SEARCH_FALLBACK:-0}"
 
@@ -162,6 +165,8 @@ if [[ "${RUN_VQ}" == "1" ]]; then
       --batch-size "${VQ_BATCH_SIZE}" \
       --encode-batch-size "${VQ_ENCODE_BATCH_SIZE}" \
       --dist-chunk "${VQ_DIST_CHUNK}" \
+      --vq-init "${VQ_INIT}" \
+      --vq-restart-threshold "${VQ_RESTART_THRESHOLD}" \
       --device "${DEVICE}"
 
   run encode_vqvae_items \
@@ -214,7 +219,7 @@ if [[ "${RUN_VQ}" == "1" ]]; then
       --items "${VQVAE_DIR}/items.parquet" \
       --outdir "${VQVAE_DIR}"
 
-VQVAE_DIR="${VQVAE_DIR}" python3 - <<'PY'
+VQVAE_DIR="${VQVAE_DIR}" VQ_K="${VQ_K}" python3 - <<'PY'
 import os
 import pandas as pd
 path = os.path.join(os.environ["VQVAE_DIR"], "items.parquet")
@@ -254,6 +259,7 @@ EVAL_CMD=(
   --outputs-root "${OUT_ROOT}"
   --expand-rq-M "${EXPAND_RQ_M}"
   --expand-vq-T "${EXPAND_VQ_T}"
+  --rq-prefix-levels "${RQ_PREFIX_LEVELS}"
   --max-test "${EVAL_MAX_TEST}"
   --out "${RESULT_CSV}"
 )

@@ -12,7 +12,10 @@ def _load_ids(ids_path: str):
         ids = np.load(ids_path, allow_pickle=True).astype(str).tolist()
         return ids
     if ext == ".pt":
-        obj = torch.load(ids_path, map_location="cpu")
+        try:
+            obj = torch.load(ids_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            obj = torch.load(ids_path, map_location="cpu")
         if isinstance(obj, dict) and "ids" in obj:
             return [str(x) for x in obj["ids"]]
         raise ValueError("For .pt, expect a dict with key 'ids'.")
